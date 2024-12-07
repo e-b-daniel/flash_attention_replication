@@ -44,3 +44,6 @@ def flash_attention_torch(q, k, v, mask=None):
             
     with sdpa_kernel(backends=SDPBackend.FLASH_ATTENTION):
         return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+
+def unspecified_attention_torch(q,k,v):
+    F.scaled_dot_product_attention(q, k, v)
