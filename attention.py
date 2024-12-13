@@ -10,19 +10,19 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 import triton
 import triton.language as tl
 
-def normal_attention_torch(q, k, v, is_causal=False):
+def normal_attention_torch(q, k, v):
     """
     Torch's implementation of scaled dot product attention in C++.
     """
-    with sdpa_kernel(backends=SDPBackend.MATH):
-        start = time.perf_counter()
-        output =  F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, dropout_p=0.0)
-        end_time = time.perf_counter() - start
-        return output, end_time
-    # start = time.perf_counter()
-    # output = scaled_dot_product_attention(q, k, v, is_causal=is_causal)
-    # end_time = time.perf_counter() - start
-    # return output, end_time
+    # with sdpa_kernel(backends=SDPBackend.MATH):
+    #     start = time.perf_counter()
+    #     output =  F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, dropout_p=0.0)
+    #     end_time = time.perf_counter() - start
+    #     return output, end_time
+    start = time.perf_counter()
+    output = scaled_dot_product_attention(q, k, v, is_causal=True)
+    end_time = time.perf_counter() - start
+    return output, end_time
     
     
 
@@ -54,7 +54,7 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None,
 
 
 
-def flash_attention_torch(q, k, v, is_causal=False):
+def flash_attention_torch(q, k, v):
     """
     Torch's implementation of FlashAttention.
     """
@@ -66,7 +66,7 @@ def flash_attention_torch(q, k, v, is_causal=False):
             
     with sdpa_kernel(backends=SDPBackend.FLASH_ATTENTION):
         start = time.perf_counter()
-        result = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, dropout_p=0.0) 
+        result = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0) 
         end_time = time.perf_counter() - start
         return result, end_time
 # refrenced from https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py v1 changelog
@@ -87,7 +87,6 @@ def _fwd_kernel(
     Br: tl.constexpr,  # Br in paper
     Bt: tl.constexpr,  # Bt in paper
     hidden: tl.constexpr,  # Hidden dim
-    is_causal: tl.constexpr,
 ):  
     start_m = tl.program_id(0)      # which portion of the sequence am I in? Which block of the queries is mine?
     off_hz = tl.program_id(1)       # which batch and head am I in? But really just which head?
@@ -100,7 +99,7 @@ def _fwd_kernel(
     #             ^^^                           ^^^                           ^^^
     #       get the right head    get all of the correct queries      get all of the hidden dims
     # same logic for K and V but using the columns for the correct k,v
-    off_kv = off_hz * stride_head + offs_bt[:, None] * stride_seq + offs_d[None, :] * hidden_dim
+    off_kv = off_hz * stride_head + offs_bt[:, None] * stride_seq + offs_d[None, :] * hidden_dim # nice 2d list
     # Initialize pointers to Q, K, V using the above offsets
     q_ptrs = Q + off_q  
     k_ptrs = K + off_kv
@@ -115,15 +114,13 @@ def _fwd_kernel(
     q = tl.load(q_ptrs)
     # loop over k, v and update accumulator
 
-    for start_n in tl.range(0, (start_m + 1) * Br, Bt):  # I think this is wrong
-    # for start_n in tl.range(0, seq_len, Bt):
+    for start_n in tl.range(0, (start_m + 1) * Br, Bt):
         # load k, v
         k = tl.load(k_ptrs + start_n * stride_seq)
         v = tl.load(v_ptrs + start_n * stride_seq)
         # Calculate qk and mask out future if causal
         qk = tl.dot(q, tl.trans(k)) * sm_scale
-        if is_causal:
-            qk += tl.where(offs_br[:, None] >= (start_n + offs_bt[None, :]), 0, float("-inf")) # mask out future
+        qk += tl.where(offs_br[:, None] >= (start_n + offs_bt[None, :]), 0, float("-inf")) # mask out future
         
         # Compute the softmax using the old max
         m_ij = tl.max(qk, 1)
@@ -158,7 +155,7 @@ def _fwd_kernel(
     tl.store(m_ptrs, m_i)
     tl.store(out_ptrs, acc)
 
-def triton_forward(q, k, v, is_causal=False):
+def triton_forward(q, k, v):
     start = time.perf_counter()
     BLOCK = 64
     o = torch.empty_like(q)  # create space for output
@@ -189,7 +186,6 @@ def triton_forward(q, k, v, is_causal=False):
         Br=BLOCK,
         Bt=BLOCK,
         hidden=q.shape[3],
-        is_causal=is_causal,
     )
     end_time = time.perf_counter() - start
     return o, end_time
